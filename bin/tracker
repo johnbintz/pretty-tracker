@@ -1,0 +1,468 @@
+#!/usr/bin/env ruby
+
+require 'rubygems'
+gem 'pivotal-tracker', '~> 0.4.0'
+require 'pivotal-tracker'
+require 'thor'
+require 'rainbow'
+require 'tempfile'
+require 'yaml'
+
+CACHE_TIME = 60
+GIT_PIVOTAL_PROJECT_ID_KEY = "pivotal.project-id"
+CACHE_PATH = '~/.tracker-cache'
+LAST_STORY_PATH = File.expand_path("#{CACHE_PATH}/last-story")
+
+module PivotalTracker
+  class Story
+    def move(story)
+      Client.connection["/projects/#{project_id}/stories/#{id}/moves"].post(:move => { :move => :before, :target => story.id})
+    end
+  end
+end
+
+class Tracker < Thor
+  method_options :first => :boolean
+  method_options :project => :string
+  method_options :description => :string
+  method_options :api_token => :string
+  method_options %w{labels -l} => :string
+  method_options %w{skip_description --nd} => :boolean
+  method_options :external => :boolean
+  def initialize(*args)
+    super
+    @options = options.dup
+
+    if File.file?(path = File.expand_path('~/.trackerrc'))
+      @options.merge!(YAML.load_file(path))
+    end
+
+    api_token = %x{git config --get pivotal.api-token}.strip
+    api_token = @options[:api_token] if api_token.empty?
+
+    PivotalTracker::Client.token = api_token
+
+    @stdin_content = nil
+    if !$stdin.tty?
+      @stdin_content = $stdin.read
+      $stdin.close
+    end
+  end
+
+  started_color = 'f3f3d1'
+
+  COLORS = {
+    :feature => 'ffff44',
+    :chore => '999999',
+    :bug => 'ff2233',
+    :release => '0044cc',
+    :id => '22cc33',
+    :label => '33ee55',
+    :project => 'dd2211',
+    :story => 'ffffff',
+    :comment => 'ddcc11',
+    :description => '2255ee',
+    :started => started_color,
+    :finished => started_color,
+    :delivered => started_color,
+    :unscheduled => 'e4eff7',
+    :score => '2255cc'
+  }
+
+  desc "feature NAME <score>", "Create a new feature in the current project"
+  def feature(name, estimate = nil)
+    params = { :name => name, :story_type => :feature, :current_state => :unstarted }
+    params[:estimate] = estimate if estimate
+    create_story(params)
+    clear_cache!
+  end
+
+  desc "chore NAME", "Create a new chore in the current project"
+  def chore(name)
+    create_story(:name => name, :story_type => :chore, :current_state => :unstarted)
+    clear_cache!
+  end
+
+  desc "release NAME", "Create a new release in the current project"
+  def release(name)
+    create_story(:name => name, :story_type => :release, :current_state => :unstarted)
+    clear_cache!
+  end
+
+  desc "bug NAME", "Create a new bug in the current project"
+  def bug(name)
+    create_story(:name => name, :story_type => :bug, :current_state => :unstarted)
+    clear_cache!
+  end
+
+  desc "start NAME-OR-ID", "Start a story"
+  def start(name_or_id = nil)
+    with_story(name_or_id) do |story|
+      story.update(:current_state => :started)
+      puts "Story #{story.name} started"
+      clear_cache!
+    end
+  end
+
+  desc "deliver NAME-OR-ID", "Deliver a feature or bug"
+  def deliver(name_or_id = nil)
+    with_story(name_or_id) do |story|
+      story.update(:current_state => :delivered)
+      puts "Story #{story.name} delivered"
+      clear_cache!
+    end
+  end
+
+  desc "accept NAME-OR-ID", "Accept a feature or bug"
+  def accept(name_or_id)
+    with_story(name_or_id) do |story|
+      story.update(:current_state => :accepted)
+      puts "Story #{story.name} accepted"
+      clear_cache!
+    end
+  end
+
+  desc "finish NAME-OR-ID <COMMENT>", "Finish a story and add an optional comment"
+  def finish(name_or_id, comment = nil)
+    with_story(name_or_id) do |story|
+      comment = external(:comment) if !comment && @options[:external]
+
+      story.update(:current_state => :finished)
+      PivotalTracker::Note.new(:owner => story, :text => comment).create if comment && !comment.empty?
+      puts "Story #{story.name} finished"
+      clear_cache!
+    end
+  end
+
+  desc "labels NAME-OR-ID <labels>", "Update the labels on a story"
+  def labels(name_or_id, label_list)
+    with_story(name_or_id) do |story|
+      story.update(:labels => label_list)
+      puts "Labels for #{story.name.foreground(COLORS[:story])} changed to #{label_list.foreground(COLORS[:label])}"
+      clear_cache!
+    end
+  end
+
+  desc "score NAME-OR-ID <score>", "Update the score on a story"
+  def score(name_or_id, score)
+    with_story(name_or_id) do |story|
+      story.update(:estimate => score)
+      puts "Score for #{story.name.foreground(COLORS[:feature])} changed to #{score.foreground(COLORS[:score])}"
+      clear_cache!
+    end
+  end
+
+  desc "comment NAME-OR-ID <COMMENT>", "Add a comment to a story"
+  def comment(name_or_id, comment = nil)
+    with_story(name_or_id) do |story|
+      if !comment
+        if @stdin_content
+          comment = @stdin_content
+        else
+          comment = external(:comment, story_text_history(story)) if @options[:external]
+        end
+      end
+
+      if comment && !comment.empty?
+        PivotalTracker::Note.new(:owner => story, :text => comment).create
+        puts "Comment #{comment.foreground(COLORS[:comment])} added to #{story.name}"
+        clear_cache!
+      else
+        puts "No comment provided!"
+      end
+    end
+  end
+
+  desc "show <NAME-OR-ID>", "Show a single story with description and comments"
+  def show(name_or_id = nil)
+    with_story(name_or_id) do |story|
+      comments = []
+      wrap_text(story_chrono_history(story)) { |line| comments << line.foreground(COLORS[:comment]) }
+
+      output = <<-ANSI
+#{story.name.foreground(COLORS[:story])} #{"(#{story.id})".foreground(COLORS[:id])}
+
+#{comments.join("\n")}
+ANSI
+
+      file = Tempfile.new('tracker')
+      file.puts output
+      file.close
+
+      system %{bash -c 'less -fr #{file.path}'}
+    end
+  end
+
+  desc "list <FILTER>", "List all stories"
+  def list(filter = nil)
+    search_filter = filter ? search_value(filter) : nil
+
+    non_accepted_stories.each do |story|
+      if !search_filter || story.name[search_filter]
+        case story.current_state
+        when 'unstarted'
+          change_section(:backlog)
+        when 'unscheduled'
+          change_section(:icebox)
+        else
+          change_section(:current)
+        end
+
+        print_story(story) 
+      end
+    end
+  end
+
+  desc "delete NAME-OR-ID", "Delete a story"
+  def delete(name_or_id)
+    with_story(name_or_id) do |story|
+      story.delete
+
+      puts "Story #{story.name} deleted"
+      clear_cache!
+    end
+  end
+
+  desc "export-for PROJECT", "Get the bash export for the specified project"
+  def export_for(project_search)
+    if project(project_search)
+      puts "export TRACKER_PROJECT=#{project.id}"
+    end
+  end
+
+  desc "set-git-project PROJECT", "Set pivotal.project-id to the requested project"
+  def set_git_project(project_search)
+    if project(project_search)
+      system %{git config --local #{GIT_PIVOTAL_PROJECT_ID_KEY} #{project.id}}
+      puts "#{project.name} set for this git repo"
+    end
+  end
+
+  desc "project", "Get the current project as determined by current config"
+  def project
+    if project
+      puts "#{project.id} #{project.name}"
+    end
+  end
+
+  default_task :list
+
+  no_tasks do
+    def story_text_history(story)
+      description_and_notes(story).reverse.join("\n")
+    end
+
+    def story_chrono_history(story)
+      description_and_notes(story).join("\n")
+    end
+    
+    def description_and_notes(story)
+      ([ story.description ] + PivotalTracker::Note.all(story).collect(&:text))
+    end
+
+    def create_story(params)
+      if @options[:external] && !@options[:skip_description]
+        params[:description] ||= external(:story_description)
+      else
+        params[:description] ||= @options[:description]
+      end
+
+      params[:labels] ||= @options[:labels]
+
+      story = project.stories.create(params)
+      story.move(first_in_icebox) if @options[:first] && first_in_icebox
+      puts "#{story.story_type.capitalize} #{story.name.foreground(COLORS[story.story_type.to_sym])} created in #{project.name.foreground(COLORS[:project])}"
+
+      story
+    end
+
+    def external(type, initial_comments = nil)
+      file = Tempfile.new("tracker")
+      file.puts
+      file.puts "# Write your #{type} here, lines starting with # are ignored"
+
+      if initial_comments
+        wrap_text(initial_comments) { |line| file.puts "# #{line}" }
+        file.puts "#"
+      end
+      file.close
+
+      system %{bash -c "$EDITOR #{file.path}"}
+
+      lines = File.readlines(file.path).find_all { |line| line[0..0] != '#' }
+      lines.empty? ? nil : lines.join.strip
+    end
+
+    def wrap_text(text, columns = 78)
+      text.each_line do |line|
+        line = line.gsub(/ +/, ' ')
+        line_done = false
+        while line.length > 78 && !line_done
+          index = 78
+          done = false
+          while !done && !line_done
+            if line[index..index] == " "
+              yield line[0..index - 1]
+              line = line[(index + 1)..-1]
+              done = true
+            else
+              index -= 1
+              line_done = (index == 0)
+            end
+          end
+        end
+        yield line
+      end
+    end
+
+    def stories_cache
+      FileUtils.mkdir_p File.expand_path(CACHE_PATH)
+      target = File.expand_path("#{CACHE_PATH}/#{project.id}")
+
+      if !File.file?(target) || (File.mtime(target) + CACHE_TIME < Time.now)
+        stories = project.stories.all
+        File.open(target, 'wb') { |fh| Marshal.dump(stories, fh) }
+      else
+        stories = Marshal.load(File.read(target))
+      end
+
+      stories
+    end
+
+    def clear_cache!
+      FileUtils.rm_f File.expand_path("#{CACHE_PATH}/#{project.id}")
+    end
+
+    def non_accepted_stories
+      stories_cache.reject { |story| story.current_state == 'accepted' }
+    end
+
+    def with_story(name_or_id = nil)
+      if !name_or_id && File.file?(LAST_STORY_PATH)
+        name_or_id = File.read(LAST_STORY_PATH).to_i
+      end
+
+      if story = find_story(name_or_id)
+        yield story
+
+        FileUtils.mkdir_p File.expand_path(CACHE_PATH)
+        File.open(LAST_STORY_PATH, 'wb') { |fh| fh.print story.id }
+      else
+        puts "Story #{name_or_id} not found."
+      end
+    end
+
+    def project(search = nil)
+      return @project if @project
+      search ||= @options[:project] || ENV['TRACKER_PROJECT'] || %x{git config --local --get #{GIT_PIVOTAL_PROJECT_ID_KEY}}.strip
+      search = nil if search.empty?
+
+      if search
+        if search[%r{^\d+$}]
+          project = PivotalTracker::Project.find(search)
+        else
+          project = all_projects.find { |proj| proj.name[search_value(search)] }
+        end
+
+        if !project || !project.kind_of?(PivotalTracker::Project)
+          puts "Could not find project #{search.to_s.foreground(COLORS[:project])}. Valid projects:"
+
+          all_projects.each do |project|
+            print "(#{project.id})".foreground(COLORS[:id])
+            print " #{project.name.foreground(COLORS[:project])}"
+            puts
+          end
+
+          exit 1
+        end
+      else
+        puts "No project found! Set one via export-for or git-set-project."
+        exit 1
+      end
+
+      @project = project
+    end
+
+    def search_value(value)
+      search = Regexp.new(value, Regexp::IGNORECASE)
+      search = Regexp.new(value[1..-2]) if value[0..0] == '/'
+      search
+    end
+
+    def all_projects
+      @all_projects ||= PivotalTracker::Project.all
+    end
+
+    def find_story(name_or_id)
+      if !(story = project.stories.find(name_or_id.to_i))
+        search = search_value(name_or_id)
+        story = stories_cache.find { |story| story.name[search] }
+      end
+      story
+    end
+
+    def print_story(story)
+      @alternate = false if @alternate == nil
+
+      prefix = case story.story_type
+               when 'feature'
+                 "*FEATURE*".foreground(COLORS[story.story_type.to_sym])
+               when 'chore'
+                 "[CHORE]  ".foreground(COLORS[story.story_type.to_sym])
+               when 'bug'
+                 "%BUG%    ".foreground(COLORS[story.story_type.to_sym]).bright
+               when 'release'
+                 "#RELEASE#".foreground(COLORS[story.story_type.to_sym]).bright
+               end
+
+      suffix = case story.story_type
+               when 'feature'
+                 if story.estimate.to_i >= 0
+                   " #{"|" * story.estimate.to_i} #{story.estimate}".foreground(COLORS[:score])
+                 else
+                   ''
+                 end
+               else
+                 ''
+               end
+
+      max_story_name = width - 9 - 2 - 2 - 9 - 1 - suffix.gsub(/\033[^m]+m/, '').length
+      story_name = story.name[0..max_story_name]
+      story_id = "(#{story.id.to_s.rjust(9)})"
+
+      left = "#{prefix} #{story_id.foreground(COLORS[:id])} #{story_name.foreground(COLORS[story.current_state.to_sym] || COLORS[:story])} "
+      if !(%w{unscheduled unstarted}).include?(story.current_state)
+        left += "<#{story.current_state.foreground(COLORS[:project])}> "
+      end
+      left += "#{story.labels.foreground(COLORS[:label])} " if story.labels
+      left += "@".foreground(COLORS[:description]) if story.description && !story.description.empty?
+
+      right = "#{suffix}"
+
+      existing_length = (width - left.gsub(/\033[^m]+m/, '').length - right.gsub(/\033[^m]+m/, '').length)
+      center = " " * [ existing_length, 0 ].max
+
+      puts [ left, center, right ].join
+      @alternate = !@alternate
+    end
+
+    def width
+      @width ||= (%x{stty size}.strip.split.last.to_i - 2)
+    end
+
+    def change_section(which)
+      if @current_section != which
+        string = ("-- #{which.to_s.upcase} " + ("-" * width))[0..width]
+        puts string.foreground('7777cc')
+        @current_section = which
+      end
+    end
+
+    def first_in_icebox
+      project.stories.all(:current_state => 'unstarted').first
+    end
+  end
+end
+
+Tracker.start
+
