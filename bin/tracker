@@ -7,6 +7,7 @@ require 'thor'
 require 'rainbow'
 require 'tempfile'
 require 'yaml'
+require 'chronic'
 
 CACHE_TIME = 60
 GIT_PIVOTAL_PROJECT_ID_KEY = "pivotal.project-id"
@@ -68,6 +69,22 @@ class Tracker < Thor
     :unscheduled => 'e4eff7',
     :score => '2255cc'
   }
+
+  desc "catchup", "Catch up on the latest changes to all your projects"
+  method_options :limit => "30"
+  def catchup(since = 'yesterday')
+    PivotalTracker::Activity.all(nil, :limit => options[:limit].to_i, :occurred_since_date => Chronic.parse(since)).each do |activity|
+      story = activity.description.dup
+      story.gsub!(%r{^#{activity.author} }, '')
+      story.gsub!(%r{"(.*)"}, '\1'.foreground(COLORS[:comment]))
+
+      time = activity.occurred_at.strftime('%Y-%m-%d %H:%M')
+
+      project = all_projects.find { |p| p.id == activity.project_id }
+
+      puts "[#{time.foreground(COLORS[:id])}] #{activity.author.foreground(COLORS[:label])} #{story} in #{project.name.foreground(COLORS[:project])} (#{activity.stories.first.id.to_s.foreground(COLORS[:id])})"
+    end
+  end
 
   desc "feature NAME <score>", "Create a new feature in the current project"
   def feature(name, estimate = nil)

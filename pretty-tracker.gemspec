@@ -23,4 +23,5 @@ Gem::Specification.new do |s|
   s.add_runtime_dependency "pivotal-tracker", '~> 0.4.0'
   s.add_runtime_dependency "rainbow"
   s.add_runtime_dependency "thor"
+  s.add_runtime_dependency "chronic"
 end
